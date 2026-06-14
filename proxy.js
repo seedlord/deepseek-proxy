@@ -89,7 +89,7 @@ function forwardToDeepSeek(req, res, body, clientPath, meta) {
   function decInflight() {
     if (!inflightDecd) {
       inflightDecd = true;
-      decInflight();
+      tui.inflightDec();
     }
   }
 
@@ -127,7 +127,18 @@ function forwardToDeepSeek(req, res, body, clientPath, meta) {
       tui.logLine(TAGS.ERR + 'Upstream responded ' + statusCode);
     }
 
-    res.writeHead(statusCode, proxyRes.headers);
+    // Strip hop-by-hop headers from upstream response
+    const HOP_BY_HOP = new Set([
+      'connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer',
+      'upgrade', 'proxy-authenticate', 'proxy-authorization',
+    ]);
+    const fwdHeaders = {};
+    for (const [k, v] of Object.entries(proxyRes.headers)) {
+      if (!HOP_BY_HOP.has(k.toLowerCase())) {
+        fwdHeaders[k] = v;
+      }
+    }
+    res.writeHead(statusCode, fwdHeaders);
 
     // ── Response accumulation (5.2: capped buffer) ─────────────────
     let buf          = '';
@@ -145,12 +156,10 @@ function forwardToDeepSeek(req, res, body, clientPath, meta) {
         toolNames.add(m[1]);
       }
 
-      // 5.2: sliding window — keep only last MAX_BUF bytes
-      if (buf.length < MAX_BUF) {
-        buf += chunkStr;
-        if (buf.length > MAX_BUF) {
-          buf = buf.slice(buf.length - MAX_BUF);
-        }
+      // 5.2: true sliding window — always append, keep only last MAX_BUF bytes
+      buf += chunkStr;
+      if (buf.length > MAX_BUF) {
+        buf = buf.slice(buf.length - MAX_BUF);
       }
     });
 
@@ -266,6 +275,15 @@ let server;
 
 function createServer() {
   return http.createServer((req, res) => {
+  // Handle client socket errors to prevent process crash
+  req.on('error', (err) => {
+    if (!res.headersSent) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Bad Request' }));
+    }
+  });
+  res.on('error', (_) => { /* client disconnected — ignore */ });
+
   // ── GET routes ────────────────────────────────────────────────────
   if (req.method === 'GET') {
     // 3.3: unified toggle handling
@@ -300,20 +318,22 @@ function createServer() {
       }));
     }
 
-    // CSV download
+    // CSV download — async to avoid blocking event loop
     if (req.url === '/metrics') {
       if (!fileLogging) {
         res.writeHead(503, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'File logging is disabled' }));
       }
-      try {
-        const csv = fs.readFileSync(config.LOG_FILE, 'utf8');
-        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end(csv);
-      } catch (err) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'Could not read metrics file' }));
-      }
+      fs.readFile(config.LOG_FILE, 'utf8', (err, csv) => {
+        if (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Could not read metrics file' }));
+        } else {
+          res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end(csv);
+        }
+      });
+      return;
     }
 
     // Fallback 404 for unknown GET routes
@@ -382,7 +402,7 @@ function createServer() {
 
     if (!sub) {
       lastModel = info.model;
-      // 7.0: route MAIN request to its session bucket (lookup-or-create by fingerprint)
+      // Route MAIN request to its session bucket (lookup-or-create by fingerprint)
       tui.activateSession(fp, info.model);
     }
 
@@ -513,13 +533,11 @@ function handleKey(key) {
       ' | Debug: ' + onOff(debugLogging));
     tui.paintHeader(getState());
   } else if (k === 'h') {
-    // Hot reload: reset MAIN stats, then reload code modules
-    tui.resetMainStats();
+    // Hot reload: reload code modules, preserve all session stats
     reloadModules();
   } else if (k === 'q') {
     tui.logLine(TAGS.CLI + 'Shutting down.');
-    cleanup();
-    process.exit(0);
+    shutdown();
   }
 }
 
@@ -570,6 +588,9 @@ function startProxy() {
 
   server = createServer();
   server.timeout = config.SERVER_TIMEOUT;
+  server.on('error', (err) => {
+    tui.logError('Server', err);
+  });
 
   // Set up resize listener
   process.stdout.on('resize', handleResize);
@@ -603,27 +624,28 @@ function startProxy() {
 
 // ── Process lifecycle ───────────────────────────────────────────────
 
-function cleanup() {
+function cleanup(cb) {
   // 2e: restore terminal before exit
   try {
     process.stdin.setRawMode(false);
     process.stdin.pause();
   } catch (_) { /* already cleaned up */ }
-  server.close();
+  server.close(cb || (() => {}));
 }
 
-// 1.3: handle both SIGINT and SIGTERM
-process.on('SIGINT',  () => { cleanup(); process.exit(0); });
-process.on('SIGTERM', () => { cleanup(); process.exit(0); });
-// 2e: fallback — restore cursor even on unexpected exit
-process.on('exit', (code) => {
-  if (code !== 0) {
-    try {
-      process.stdin.setRawMode(false);
-      process.stdout.write('\n');
-    } catch (_) { /* terminal may already be gone */ }
-  }
-});
+/** Graceful shutdown: drain active connections, force-kill after 3 s */
+function shutdown() {
+  cleanup(() => {
+    try { process.stdout.write('\n'); } catch (_) { /* ignore */ }
+    process.exit(0);
+  });
+  // Safety net — force exit if graceful shutdown hangs
+  setTimeout(() => process.exit(1), 3000).unref();
+}
+
+// Handle both SIGINT and SIGTERM gracefully
+process.on('SIGINT',  shutdown);
+process.on('SIGTERM', shutdown);
 
 // Kick off
 startProxy();

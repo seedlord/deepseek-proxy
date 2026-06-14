@@ -86,7 +86,7 @@ proxy.js ── orchestrator (HTTP server, forwarding, keyboard input)
 | `R` | Reset MAIN cache stats (no reload) |
 | `p` | Enter/exit pager mode (scrollback) |
 | `s` | Print stats line to log |
-| `h` | Reset MAIN stats + hot reload all `lib/*` modules |
+| `h` | Hot reload all `lib/*` modules (preserves session stats) |
 | `q` | Quit |
 
 ### Pager mode keys (after pressing `p`)
@@ -103,7 +103,7 @@ proxy.js ── orchestrator (HTTP server, forwarding, keyboard input)
 
 ## Hot reload
 
-`h` key triggers `reloadModules()`: resets MAIN cache stats, saves TUI state (log buffer, cache stats, pager state), closes the server, clears the require cache for `lib/*` modules, re-requires them (picking up file changes), restores TUI state into the fresh modules, and restarts the server on the same port. The process never exits — log buffer and terminal session are preserved.
+`h` key triggers `reloadModules()`: saves TUI state (log buffer, session stats, pager state), closes the server, clears the require cache for `lib/*` modules, re-requires them (picking up file changes), restores TUI state into the fresh modules, and restarts the server on the same port. The process never exits — log buffer and terminal session are preserved.
 
 ## Notes
 
