@@ -182,7 +182,7 @@ function forwardToDeepSeek(req, res, body, clientPath, meta) {
         // TUI output
         tui.logMetrics(meta.reqNum, m.inputTokens, m.cacheHits,
           totalInput, m.outputTokens, calls, statusCode, m.reasoningTokens);
-        tui.addCacheStats(meta.isSub, m.cacheHits, totalInput);
+        tui.addCacheStats(meta.fingerprint, meta.isSub, m.cacheHits, totalInput);
         tui.paintHeader(getState());
 
         // Debug: usage blocks without output
@@ -378,11 +378,12 @@ function createServer() {
     reqCount++;
     const reqNum = reqCount;
     const info = inspectPayload(jsonPayload);
+    const fp = sessionFingerprint(req.headers.authorization);
 
     if (!sub) {
       lastModel = info.model;
-      // Detect session change and reset MAIN cache stats
-      tui.checkMainSession(sessionFingerprint(req.headers.authorization));
+      // 7.0: route MAIN request to its session bucket (lookup-or-create by fingerprint)
+      tui.activateSession(fp, info.model);
     }
 
     // ── Subagent thinking override ──────────────────────────────────
@@ -428,7 +429,7 @@ function createServer() {
 
     // ── Forward ────────────────────────────────────────────────────
     forwardToDeepSeek(req, res, modifiedBody, clientPath, {
-      isSub: sub, reqNum, info, agentId,
+      isSub: sub, reqNum, info, agentId, fingerprint: fp,
     });
   });
 });
