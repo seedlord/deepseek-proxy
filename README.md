@@ -12,13 +12,16 @@ A zero-dependency Node.js HTTP proxy that sits between the Claude Code VS Code e
 
 ## Features
 
-- **Live TUI** — Real-time header bar showing port, request count, model, separate MAIN/SUB cache hit rates, toggle states, uptime, and keyboard shortcuts. Scrollable log area with color-coded request/response lines.
+- **Live TUI** — Real-time header bar showing port, request count, model, session badge (project path, app type, git status), separate MAIN/SUB cache hit rates, toggle states (including debug TUI print), uptime, and keyboard shortcuts. Color-coded request/response lines with aligned columns.
+- **Session metadata** — Extracts project directory, app type (`[vscode]` / `[cli]`), and git-repo status from the system prompt and request headers. Displayed as compact badges in the header.
 - **Subagent thinking override** — Automatically injects the main agent's `thinking` and `output_config` into subagent requests so they inherit the main session's reasoning budget. Toggle on/off with a single keypress.
 - **CSV metrics logging** — Records token usage (input, cache hits, output, reasoning), model info, thinking config, tool calls, and more per request. Async, non-blocking writes.
-- **Separate cache tracking** — MAIN and SUB cache hit rates tracked independently (they have completely separate context caches).
-- **Hot reload** — Reload all `lib/*` modules without restarting the process. Log buffer and terminal state are preserved.
+- **Compressed response support** — Transparently decompresses gzip/deflate/brotli responses (used by DeepSeek for `think:none` requests) before metrics extraction.
+- **Separate cache tracking** — MAIN and SUB cache hit rates tracked independently per session (they have completely separate context caches).
+- **Debug logging** — `d` enables comprehensive debug output to `proxy-debug.log`. `D` (Shift+D) toggles TUI visibility of debug lines independently.
+- **Hot reload** — Reload all `lib/*` modules without restarting the process. Log buffer, session stats, and terminal state are preserved.
 - **Pager mode** — Freeze the log and scroll through history with vim-like keys (`j`/`k`, `g`/`G`, `PgUp`/`PgDn`). Header stays live.
-- **Session detection** — Automatically detects API key changes and resets MAIN cache stats for the new session.
+- **Session detection** — Automatically detects API key changes and creates separate session buckets with independent cache tracking.
 
 ## Quick Start
 
@@ -50,12 +53,15 @@ Then configure Claude Code to use `http://localhost:4000` as its API endpoint.
 proxy.js ── orchestrator (HTTP server, forwarding, keyboard input)
   ├── lib/config.js    — constants, env-var overrides, CSV header
   ├── lib/colors.js    — ANSI escapes, log tags, formatting helpers
-  ├── lib/tui.js       — terminal UI: header bar, pager/scrollback, cache stats, throttled repaint
+  ├── lib/tui.js       — terminal UI: header bar, pager/scrollback, session/cache stats, throttled repaint
   ├── lib/inspector.js — parses Claude API JSON payloads to extract model/thinking/tool info
   └── lib/metrics.js   — extracts token usage from streaming response buffers, writes CSV
+Output:
+  ├── proxy-metrics.csv  — per-request token metrics
+  └── proxy-debug.log    — full debug output (when debug mode is on)
 ```
 
-**Request flow:** Client → HTTP server → body read with size cap → JSON parse → payload inspection → session detection (via auth header fingerprint) → subagent thinking override (if applicable) → forward to DeepSeek via HTTPS keep-alive → streaming response → metrics extraction from tail buffer → TUI log + separated MAIN/SUB cache stats + CSV append.
+**Request flow:** Client → HTTP server → body read with size cap → JSON parse → payload inspection + session metadata extraction (project dir, app type, git status) → session activation (via auth header fingerprint) → subagent thinking override (if applicable) → forward to DeepSeek via HTTPS keep-alive → streaming response → gzip decompression (if compressed) → metrics extraction from tail buffer → TUI log + per-session cache stats + CSV append + debug file log.
 
 ## HTTP Endpoints
 
@@ -75,7 +81,8 @@ proxy.js ── orchestrator (HTTP server, forwarding, keyboard input)
 |---|---|
 | `t` | Toggle subagent thinking override |
 | `l` | Toggle CSV file logging |
-| `d` | Toggle debug logging |
+| `d` | Toggle debug logging (file always, TUI off by default) |
+| `D` | Toggle debug TUI print (only when debug mode is on) |
 | `r` | Redraw screen |
 | `R` | Reset MAIN cache stats (no reload) |
 | `p` | Enter/exit pager mode (scrollback) |
@@ -109,7 +116,7 @@ Each request appends one row to the CSV log. Columns:
 ## Requirements
 
 - Node.js ≥ 18
-- No npm dependencies — uses only `http`, `https`, `fs`, `readline` built-ins
+- No npm dependencies — uses only `http`, `https`, `fs`, `readline`, `zlib` built-ins
 - Terminal with ANSI support (Windows 10 1511+, macOS, Linux)
 
 ## License

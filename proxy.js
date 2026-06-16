@@ -34,6 +34,7 @@ function sessionFingerprint(authHeader) {
 let forceSubagentThinking = true;
 let fileLogging           = true;
 let debugLogging          = false;
+let debugTuiPrint         = false;  // D key: show debug in TUI (file always logs)
 let reqCount              = 0;
 let lastModel             = '?';
 let lastMainThinking      = { type: 'adaptive' };
@@ -45,6 +46,15 @@ const keepAliveAgent = new https.Agent({
 
 // ── Helpers ────────────────────────────────────────────────────────
 
+/** Write debug output to both TUI (truncated) and proxy-debug.log (full). */
+function debugLog(msg) {
+  // TUI: only when debugTuiPrint is toggled (D key)
+  if (debugTuiPrint) tui.logLine(TAGS.DEBUG + msg);
+  // File: always log when debug mode is on
+  const entry = new Date().toISOString() + ' ' + msg + '\n';
+  fs.appendFile('proxy-debug.log', entry, 'utf8', () => {});
+}
+
 function isSubagent(req) {
   return !!req.headers['x-claude-code-agent-id'];
 }
@@ -52,7 +62,7 @@ function isSubagent(req) {
 /** Build the state snapshot for the TUI header */
 function getState() {
   return {
-    reqCount, lastModel, forceSubagentThinking, fileLogging, debugLogging,
+    reqCount, lastModel, forceSubagentThinking, fileLogging, debugLogging, debugTuiPrint,
     port: config.PORT,
   };
 }
@@ -221,10 +231,14 @@ function forwardToDeepSeek(req, res, body, clientPath, meta) {
         tui.addCacheStats(meta.fingerprint, meta.isSub, m.cacheHits, totalInput);
         tui.paintHeader(getState());
 
-        // Debug: dump buffer tail when metrics are all zero
-        if (debugLogging && totalInput === 0 && m.outputTokens === 0 && buf.length > 0) {
-          const hasUsage = buf.includes('"usage"');
-          tui.logLine(TAGS.DEBUG + ' ALL-ZERO enc=' + (contentEnc || 'none') + ' buf=' + buf.length + 'b hasUsage=' + hasUsage + ' tail:' + buf.slice(-200));
+        // Debug: response metadata + buffer tail
+        if (debugLogging) {
+          const usageHint = buf.includes('"usage"') ? 'usage✓' : 'usage✗';
+          const bufPreview = totalInput === 0 ? ' tail:' + buf.slice(-300) : '';
+          debugLog('RES #' + meta.reqNum + ' status=' + statusCode + ' enc=' + (contentEnc || 'none') +
+            ' buf=' + buf.length + 'b ' + usageHint +
+            ' in=' + m.inputTokens + ' cache=' + m.cacheHits + ' out=' + m.outputTokens + ' reason=' + m.reasoningTokens +
+            ' calls=' + calls + bufPreview);
         }
 
         // CSV logging (2a: async, non-blocking)
@@ -427,8 +441,26 @@ function createServer() {
 
     if (!sub) {
       lastModel = info.model;
+      // Extract session metadata from system prompt (first MAIN request per session)
+      let projectDir = '', isGit = false;
+      const sys = jsonPayload.system;
+      if (sys) {
+        let sysText = '';
+        if (typeof sys === 'string') {
+          sysText = sys;
+        } else if (Array.isArray(sys)) {
+          sysText = sys.map(b => (b && b.text) || '').join('\n');
+        }
+        const m = sysText.match(/(?:working|primary)\s+(?:directory|dir)\s*:?\s*(\S+)/i);
+        if (m) projectDir = m[1];
+        isGit = /is a git repository\s*:\s*true/i.test(sysText);
+      }
+      // App type from user-agent: claude-vscode → vscode, claude-cli → cli
+      const ua = (req.headers['user-agent'] || '').toLowerCase();
+      const appType = ua.includes('claude-vscode') ? 'vscode' :
+                      ua.includes('claude-cli') ? 'cli' : '';
       // Route MAIN request to its session bucket (lookup-or-create by fingerprint)
-      tui.activateSession(fp, info.model);
+      tui.activateSession(fp, info.model, projectDir, appType, isGit);
     }
 
     // ── Subagent thinking override ──────────────────────────────────
@@ -465,11 +497,24 @@ function createServer() {
       tui.logRequest(TAGS.SUB, info, reqNum, fwdTag);
     }
 
-    // ── Debug: log masked headers ──────────────────────────────────
+    // ── Debug: log headers + system prompt + request metadata ───────
     if (debugLogging && !isTokenCount) {
+      // Full masked headers
       const masked = maskAuth(req.headers);
-      tui.logLine(TAGS.DEBUG + ' headers: ' +
-        JSON.stringify(masked).substring(0, 200));
+      debugLog('REQ #' + reqNum + ' role=' + (sub ? 'SUB' : 'MAIN') + ' agent=' + agentId.substring(0, 8) +
+        ' model=' + info.model + ' think=' + info.thinkingType + ' msg=' + info.msgCount +
+        ' sysLen=' + info.systemLen + ' tools=' + info.lastAssistantTools +
+        ' in=' + info.lastUserHint + ' headers=' + JSON.stringify(masked));
+      // System prompt content (full — where project/memory paths live)
+      const sys = jsonPayload.system;
+      if (sys) {
+        let sysText = '';
+        if (typeof sys === 'string') sysText = sys;
+        else if (Array.isArray(sys)) sysText = sys.map(b => (b && b.text) || '').join('\n');
+        if (sysText.length > 0) {
+          debugLog('REQ #' + reqNum + ' system-prompt(' + sysText.length + '): ' + sysText);
+        }
+      }
     }
 
     // ── Forward ────────────────────────────────────────────────────
@@ -541,9 +586,19 @@ function handleKey(key) {
     fileLogging = !fileLogging;
     tui.logLine(TAGS.CLI + 'File Logging > ' + onOff(fileLogging));
     tui.paintHeader(getState());
+  } else if (raw === 'D') {
+    if (!debugLogging) {
+      tui.logLine(TAGS.CLI + 'Enable Debug first (d)');
+    } else {
+      debugTuiPrint = !debugTuiPrint;
+      tui.logLine(TAGS.CLI + 'Debug TUI Print > ' + onOff(debugTuiPrint));
+      tui.paintHeader(getState());
+    }
   } else if (k === 'd') {
     debugLogging = !debugLogging;
-    tui.logLine(TAGS.CLI + 'Debug Logging > ' + onOff(debugLogging));
+    if (!debugLogging) debugTuiPrint = false;  // turning debug off resets TUI print
+    tui.logLine(TAGS.CLI + 'Debug Logging > ' + onOff(debugLogging) +
+      (debugLogging ? ' (D: TUI ' + onOff(debugTuiPrint) + ')' : ''));
     tui.paintHeader(getState());
   } else if (k === 'r') {
     readline.cursorTo(process.stdout, 0, 0);
