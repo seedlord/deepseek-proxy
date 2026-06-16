@@ -8,6 +8,7 @@
 
 const http     = require('http');
 const https    = require('https');
+const zlib     = require('zlib');
 const fs       = require('fs');
 const readline = require('readline');
 
@@ -140,7 +141,10 @@ function forwardToDeepSeek(req, res, body, clientPath, meta) {
     }
     res.writeHead(statusCode, fwdHeaders);
 
-    // ── Response accumulation (5.2: capped buffer) ─────────────────
+    // ── Response accumulation (5.2: capped buffer, 6.2: compressed) ──
+    const contentEnc = (proxyRes.headers['content-encoding'] || '').toLowerCase();
+    const isCompressed = contentEnc.includes('gzip') || contentEnc.includes('deflate') || contentEnc.includes('br');
+    let rawBufs      = [];
     let buf          = '';
     const toolNames  = new Set();
     const MAX_BUF    = config.MAX_RESPONSE_BUF;
@@ -150,16 +154,21 @@ function forwardToDeepSeek(req, res, body, clientPath, meta) {
 
       if (isTokenCount) return;
 
-      // Incrementally capture tool names
-      const chunkStr = chunk.toString('utf8');
-      for (const m of chunkStr.matchAll(/"type":"tool_use"[^}]*"name":"(\w+)"/g)) {
-        toolNames.add(m[1]);
-      }
+      if (isCompressed) {
+        // Accumulate raw buffers — will decompress on end
+        rawBufs.push(chunk);
+      } else {
+        // Incrementally capture tool names
+        const chunkStr = chunk.toString('utf8');
+        for (const m of chunkStr.matchAll(/"type":"tool_use"[^}]*"name":"(\w+)"/g)) {
+          toolNames.add(m[1]);
+        }
 
-      // 5.2: true sliding window — always append, keep only last MAX_BUF bytes
-      buf += chunkStr;
-      if (buf.length > MAX_BUF) {
-        buf = buf.slice(buf.length - MAX_BUF);
+        // 5.2: true sliding window — always append, keep only last MAX_BUF bytes
+        buf += chunkStr;
+        if (buf.length > MAX_BUF) {
+          buf = buf.slice(buf.length - MAX_BUF);
+        }
       }
     });
 
@@ -170,6 +179,24 @@ function forwardToDeepSeek(req, res, body, clientPath, meta) {
       if (isTokenCount) {
         tui.paintHeader(getState());
         return;
+      }
+
+      // 6.2: decompress gzip/deflate/brotli responses (think:none uses gzip)
+      if (isCompressed && rawBufs.length > 0) {
+        try {
+          const raw = Buffer.concat(rawBufs);
+          try {
+            buf = zlib.gunzipSync(raw).toString('utf8');
+          } catch (_) {
+            try {
+              buf = zlib.inflateSync(raw).toString('utf8');
+            } catch (__) {
+              buf = zlib.brotliDecompressSync(raw).toString('utf8');
+            }
+          }
+        } catch (e) {
+          tui.logLine(TAGS.ERR + ' decompress failed: ' + e.message);
+        }
       }
 
       try {
@@ -194,12 +221,10 @@ function forwardToDeepSeek(req, res, body, clientPath, meta) {
         tui.addCacheStats(meta.fingerprint, meta.isSub, m.cacheHits, totalInput);
         tui.paintHeader(getState());
 
-        // Debug: usage blocks without output
-        if (debugLogging && totalInput > 0 && m.outputTokens === 0) {
-          const ub = buf.match(/"usage"\s*:\s*\{[^}]+\}/g);
-          if (ub && ub.length > 0) {
-            tui.logLine(TAGS.DEBUG + ' usage blocks without output: ' + ub.join(' | '));
-          }
+        // Debug: dump buffer tail when metrics are all zero
+        if (debugLogging && totalInput === 0 && m.outputTokens === 0 && buf.length > 0) {
+          const hasUsage = buf.includes('"usage"');
+          tui.logLine(TAGS.DEBUG + ' ALL-ZERO enc=' + (contentEnc || 'none') + ' buf=' + buf.length + 'b hasUsage=' + hasUsage + ' tail:' + buf.slice(-200));
         }
 
         // CSV logging (2a: async, non-blocking)
@@ -415,7 +440,7 @@ function createServer() {
       if (jsonPayload.output_config) lastMainOutputConfig = jsonPayload.output_config;
 
       // Log MAIN request (3.1: unified via logRequest)
-      tui.logRequest(TAGS.MAIN, info, reqNum, C.dim + '----' + C.reset + ' ');
+      tui.logRequest(TAGS.MAIN, info, reqNum, '');
 
     } else {
       // SUB: optionally override thinking for FORWARDING only (display shows original)
@@ -437,7 +462,7 @@ function createServer() {
       } else {
         fwdTag = C.yellow + '→disabled' + C.reset;
       }
-      tui.logRequest(TAGS.SUB, info, reqNum, fwdTag + ' ');
+      tui.logRequest(TAGS.SUB, info, reqNum, fwdTag);
     }
 
     // ── Debug: log masked headers ──────────────────────────────────
